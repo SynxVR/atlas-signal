@@ -1,9 +1,8 @@
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8080;
-const wss  = new WebSocketServer({ port: PORT, maxPayload: 50 * 1024 * 1024 });
+const wss  = new WebSocketServer({ port: PORT, maxPayload: 10 * 1024 * 1024 }); // 10MB max frame
 
-// hosts[deviceId] = { ws, preview, monitors, encoder, encoderLabel }
 const hosts   = {};
 const clients = {};
 
@@ -11,7 +10,20 @@ wss.on("connection", (ws) => {
   ws.deviceId = null;
   ws.role     = null;
 
-  ws.on("message", (data) => {
+  ws.on("message", (data, isBinary) => {
+
+    // Binary = raw H264 video chunk from host → relay directly to client
+    if (isBinary) {
+      const id = ws.deviceId;
+      if (!id || ws.role !== "host") return;
+      const client = clients[id];
+      if (client && client.readyState === 1) {
+        client.send(data, { binary: true });
+      }
+      return;
+    }
+
+    // Text = JSON signaling
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
 
@@ -74,7 +86,6 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        // Send monitor + encoder info to client
         ws.send(JSON.stringify({
           type:         "joined",
           deviceId:     id,
@@ -88,17 +99,13 @@ wss.on("connection", (ws) => {
         break;
       }
 
-      case "offer":
-      case "answer":
-      case "ice":
-      case "frame":
-      case "command":
-      case "input": {
-        const id  = ws.deviceId;
+      // JSON messages: relay to the other side
+      case "stream-info":
+      case "input":
+      case "command": {
+        const id = ws.deviceId;
         if (!id) return;
-        const target = ws.role === "host"
-          ? clients[id]
-          : (hosts[id] && hosts[id].ws);
+        const target = ws.role === "host" ? clients[id] : (hosts[id] && hosts[id].ws);
         if (target && target.readyState === 1)
           target.send(JSON.stringify(msg));
         break;
@@ -123,4 +130,4 @@ wss.on("connection", (ws) => {
   });
 });
 
-console.log(`Atlas signaling server running on port ${PORT}`);
+console.log(`Atlas server running on port ${PORT}`);
