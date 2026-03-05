@@ -3,94 +3,122 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 8080;
 const wss  = new WebSocketServer({ port: PORT });
 
-// Each room has exactly 2 peers: host and client
-// rooms[roomId] = { host: ws, client: ws }
-const rooms = {};
+// hosts[deviceId] = { ws, preview: base64string|null }
+const hosts   = {};
+// clients[deviceId] = ws
+const clients = {};
 
 wss.on("connection", (ws) => {
-  ws.roomId = null;
-  ws.role   = null;
+  ws.deviceId = null;
+  ws.role     = null;
 
   ws.on("message", (data) => {
     let msg;
-    try { msg = JSON.parse(data); }
-    catch { return; }
+    try { msg = JSON.parse(data); } catch { return; }
 
     switch (msg.type) {
 
-      // Host registers itself with a room ID
+      // ── Host registers ──────────────────────────────────────────────────
       case "register-host": {
-        const id = msg.roomId;
-        if (!rooms[id]) rooms[id] = { host: null, client: null };
-        rooms[id].host = ws;
-        ws.roomId = id;
-        ws.role   = "host";
-        ws.send(JSON.stringify({ type: "registered", role: "host", roomId: id }));
-        console.log(`[+] Host registered: ${id}`);
+        const id = msg.deviceId;
+        if (!id) return;
+        ws.deviceId = id;
+        ws.role     = "host";
+        hosts[id]   = { ws, preview: null };
+        ws.send(JSON.stringify({ type: "registered", deviceId: id }));
+        console.log(`[+] Host online: ${id}`);
+
+        // Notify any waiting client that host came online
+        if (clients[id] && clients[id].readyState === 1) {
+          clients[id].send(JSON.stringify({ type: "host-online" }));
+        }
         break;
       }
 
-      // Browser joins a room
+      // ── Host sends a screen preview thumbnail ───────────────────────────
+      case "preview": {
+        const id = ws.deviceId;
+        if (!id || !hosts[id]) return;
+        hosts[id].preview = msg.data; // base64 jpeg
+        // Forward preview to any connected client dashboard
+        if (clients[id] && clients[id].readyState === 1) {
+          clients[id].send(JSON.stringify({ type: "preview", data: msg.data }));
+        }
+        break;
+      }
+
+      // ── Browser checks if a device ID exists ────────────────────────────
+      case "check-device": {
+        const id = msg.deviceId;
+        const online = !!(hosts[id] && hosts[id].ws.readyState === 1);
+        ws.send(JSON.stringify({ type: "device-status", deviceId: id, online }));
+        // If online send latest preview too
+        if (online && hosts[id].preview) {
+          ws.send(JSON.stringify({ type: "preview", deviceId: id, data: hosts[id].preview }));
+        }
+        break;
+      }
+
+      // ── Browser joins a device session ──────────────────────────────────
       case "join": {
-        const id = msg.roomId;
-        if (!rooms[id] || !rooms[id].host) {
-          ws.send(JSON.stringify({ type: "error", message: "Room not found or host offline" }));
+        const id = msg.deviceId;
+        if (!id) return;
+        ws.deviceId = id;
+        ws.role     = "client";
+        clients[id] = ws;
+
+        if (!hosts[id] || hosts[id].ws.readyState !== 1) {
+          ws.send(JSON.stringify({ type: "error", message: "Host is offline" }));
           return;
         }
-        rooms[id].client = ws;
-        ws.roomId = id;
-        ws.role   = "client";
-        ws.send(JSON.stringify({ type: "joined", roomId: id }));
-        // Tell host a client joined so it can start the WebRTC offer
-        rooms[id].host.send(JSON.stringify({ type: "client-joined" }));
+
+        ws.send(JSON.stringify({ type: "joined", deviceId: id }));
+        hosts[id].ws.send(JSON.stringify({ type: "client-joined" }));
         console.log(`[+] Client joined: ${id}`);
         break;
       }
 
-      // WebRTC signaling — forward offer/answer/ice between host and client
+      // ── WebRTC signaling ─────────────────────────────────────────────────
       case "offer":
       case "answer":
       case "ice": {
-        const room = rooms[ws.roomId];
-        if (!room) return;
-        const target = ws.role === "host" ? room.client : room.host;
-        if (target && target.readyState === 1) {
-          target.send(JSON.stringify(msg));
-        }
+        const id  = ws.deviceId;
+        if (!id) return;
+        const target = ws.role === "host"
+          ? clients[id]
+          : (hosts[id] && hosts[id].ws);
+        if (target && target.readyState === 1) target.send(JSON.stringify(msg));
         break;
       }
 
-      // Commands (black screen, clipboard, lock, etc.) — forwarded host <-> client
-      case "command": {
-        const room = rooms[ws.roomId];
-        if (!room) return;
-        const target = ws.role === "host" ? room.client : room.host;
-        if (target && target.readyState === 1) {
-          target.send(JSON.stringify(msg));
-        }
+      // ── Commands / input ─────────────────────────────────────────────────
+      case "command":
+      case "input": {
+        const id  = ws.deviceId;
+        if (!id) return;
+        const target = ws.role === "host"
+          ? clients[id]
+          : (hosts[id] && hosts[id].ws);
+        if (target && target.readyState === 1) target.send(JSON.stringify(msg));
         break;
       }
     }
   });
 
   ws.on("close", () => {
-    const room = rooms[ws.roomId];
-    if (!room) return;
+    const id = ws.deviceId;
+    if (!id) return;
 
     if (ws.role === "host") {
-      // Host disconnected — notify client
-      if (room.client && room.client.readyState === 1) {
-        room.client.send(JSON.stringify({ type: "host-disconnected" }));
-      }
-      delete rooms[ws.roomId];
-      console.log(`[-] Host disconnected: ${ws.roomId}`);
+      delete hosts[id];
+      console.log(`[-] Host offline: ${id}`);
+      if (clients[id] && clients[id].readyState === 1)
+        clients[id].send(JSON.stringify({ type: "host-disconnected" }));
     } else if (ws.role === "client") {
-      // Client disconnected — notify host
-      if (room.host && room.host.readyState === 1) {
-        room.host.send(JSON.stringify({ type: "client-disconnected" }));
-      }
-      room.client = null;
-      console.log(`[-] Client disconnected: ${ws.roomId}`);
+      if (clients[id] === ws) delete clients[id];
+      if (hosts[id] && hosts[id].ws.readyState === 1)
+        hosts[id].ws.send(JSON.stringify({ type: "client-disconnected" }));
+      console.log(`[-] Client left: ${id}`);
     }
   });
 });
