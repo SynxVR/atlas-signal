@@ -102,7 +102,8 @@ wss.on("connection", (ws) => {
       // JSON messages: relay to the other side
       case "stream-info":
       case "input":
-      case "command": {
+      case "command":
+      case "request-stream": {
         const id = ws.deviceId;
         if (!id) return;
         const target = ws.role === "host" ? clients[id] : (hosts[id] && hosts[id].ws);
